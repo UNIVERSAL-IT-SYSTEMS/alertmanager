@@ -1,7 +1,7 @@
 machine:
   environment:
     QUAY_IMAGE_NAME: quay.io/coreos/alertmanager
-    DOCKER_TEST_IMAGE_NAME: quay.io/prometheus/golang-builder:1.5.4-main
+    DOCKER_TEST_IMAGE_NAME: quay.io/prometheus/golang-builder:1.6.2-main
     REPO_PATH: github.com/prometheus/alertmanager
   pre:
     - sudo curl -L -o /usr/bin/docker 'https://s3-external-1.amazonaws.com/circle-downloads/docker-1.9.1-circleci'
@@ -15,7 +15,7 @@ dependencies:
     - go get -u github.com/prometheus/promu
     - docker info
   override:
-    - promu crossbuild
+          - promu crossbuild -p linux/amd64
     - ln -s .build/linux-amd64/alertmanager alertmanager
     - |
       if [ -n "$CIRCLE_TAG" ]; then
@@ -42,7 +42,6 @@ deployment:
     tag: /^[0-9]+(\.[0-9]+){2}(-.+|[^-.]*)$/
     owner: coreos
     commands:
-      - mkdir $CIRCLE_ARTIFACTS/releases/ && cp -a .tarballs/* $CIRCLE_ARTIFACTS/releases/
       - docker login -e $QUAY_EMAIL -u $QUAY_LOGIN -p $QUAY_PASSWORD quay.io
       - |
         if [[ "$CIRCLE_TAG" =~ ^[0-9]+(\.[0-9]+){2}$ ]]; then
