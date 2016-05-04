@@ -15,7 +15,7 @@ dependencies:
     - go get -u github.com/prometheus/promu
     - docker info
   override:
-          - promu crossbuild -p linux/amd64
+    - promu crossbuild -p linux/amd64
     - ln -s .build/linux-amd64/alertmanager alertmanager
     - |
       if [ -n "$CIRCLE_TAG" ]; then
