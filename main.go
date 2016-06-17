@@ -14,8 +14,6 @@
 package main
 
 import (
-	"bytes"
-	"database/sql"
 	"flag"
 	"fmt"
 	"net"
@@ -24,22 +22,20 @@ import (
 	"os"
 	"os/signal"
 	"path"
-	"path/filepath"
 	"strings"
 	"syscall"
-	tmpltext "text/template"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/route"
+	"github.com/prometheus/common/version"
 
 	"github.com/prometheus/alertmanager/config"
 	"github.com/prometheus/alertmanager/notify"
-	"github.com/prometheus/alertmanager/provider/sqlite"
+	"github.com/prometheus/alertmanager/provider/boltmem"
 	"github.com/prometheus/alertmanager/template"
 	"github.com/prometheus/alertmanager/types"
-	"github.com/prometheus/alertmanager/version"
 )
 
 var (
@@ -68,40 +64,44 @@ var (
 func init() {
 	prometheus.MustRegister(configSuccess)
 	prometheus.MustRegister(configSuccessTime)
+	prometheus.MustRegister(version.NewCollector("alertmanager"))
 }
 
 func main() {
 	flag.Parse()
 
-	printVersion()
 	if *showVersion {
+		fmt.Fprintln(os.Stdout, version.Print("alertmanager"))
 		os.Exit(0)
 	}
+
+	log.Infoln("Starting alertmanager", version.Info())
+	log.Infoln("Build context", version.BuildContext())
 
 	err := os.MkdirAll(*dataDir, 0777)
 	if err != nil {
 		log.Fatal(err)
 	}
-	db, err := sql.Open("sqlite3", filepath.Join(*dataDir, "am.db"))
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
 
 	marker := types.NewMarker()
 
-	alerts, err := sqlite.NewAlerts(db)
+	alerts, err := boltmem.NewAlerts(*dataDir)
 	if err != nil {
 		log.Fatal(err)
 	}
-	notifies, err := sqlite.NewNotifies(db)
+	defer alerts.Close()
+
+	notifies, err := boltmem.NewNotificationInfo(*dataDir)
 	if err != nil {
 		log.Fatal(err)
 	}
-	silences, err := sqlite.NewSilences(db, marker)
+	defer notifies.Close()
+
+	silences, err := boltmem.NewSilences(*dataDir, marker)
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer silences.Close()
 
 	var (
 		inhibitor *Inhibitor
@@ -171,12 +171,14 @@ func main() {
 		}
 		tmpl.ExternalURL = amURL
 
+		inhibitor.Stop()
 		disp.Stop()
 
 		inhibitor = NewInhibitor(alerts, conf.InhibitRules, marker)
 		disp = NewDispatcher(alerts, NewRoute(conf.Route, nil), build(conf.Receivers), marker)
 
 		go disp.Run()
+		go inhibitor.Run()
 
 		return nil
 	}
@@ -187,45 +189,38 @@ func main() {
 
 	router := route.New()
 
-	RegisterWeb(router.WithPrefix(amURL.Path))
+	webReload := make(chan struct{})
+	RegisterWeb(router.WithPrefix(amURL.Path), webReload)
 	api.Register(router.WithPrefix(path.Join(amURL.Path, "/api")))
 
-	log.Infof("Listening on %s", *listenAddress)
+	log.Infoln("Listening on", *listenAddress)
 	go listen(router)
 
 	var (
-		hup  = make(chan os.Signal)
-		term = make(chan os.Signal)
+		hup      = make(chan os.Signal)
+		hupReady = make(chan bool)
+		term     = make(chan os.Signal)
 	)
 	signal.Notify(hup, syscall.SIGHUP)
 	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		for range hup {
+		<-hupReady
+		for {
+			select {
+			case <-hup:
+			case <-webReload:
+			}
 			reload()
 		}
 	}()
 
+	// Wait for reload or termination signals.
+	close(hupReady) // Unblock SIGHUP handler.
+
 	<-term
 
 	log.Infoln("Received SIGTERM, exiting gracefully...")
-}
-
-var versionInfoTmpl = `
-alertmanager, version {{.version}} (branch: {{.branch}}, revision: {{.revision}})
-  build user:       {{.buildUser}}
-  build date:       {{.buildDate}}
-  go version:       {{.goVersion}}
-`
-
-func printVersion() {
-	t := tmpltext.Must(tmpltext.New("version").Parse(versionInfoTmpl))
-
-	var buf bytes.Buffer
-	if err := t.ExecuteTemplate(&buf, "version", version.Map); err != nil {
-		panic(err)
-	}
-	fmt.Fprintln(os.Stdout, strings.TrimSpace(buf.String()))
 }
 
 func extURL(s string) (*url.URL, error) {
