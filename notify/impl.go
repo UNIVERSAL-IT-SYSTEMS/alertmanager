@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -251,6 +252,12 @@ func (n *Email) auth(mechs string) (smtp.Auth, error) {
 				return nil, fmt.Errorf("invalid address: %s", err)
 			}
 			return smtp.PlainAuth(identity, username, password, host), nil
+		case "LOGIN":
+			password := string(n.conf.AuthPassword)
+			if password == "" {
+				continue
+			}
+			return LoginAuth(username, password), nil
 		}
 	}
 	return nil, nil
@@ -563,7 +570,7 @@ func (n *Hipchat) Notify(ctx context.Context, as ...*types.Alert) error {
 		data     = n.tmpl.Data(receiver(ctx), groupLabels(ctx), as...)
 		tmplText = tmplText(n.tmpl, data, &err)
 		tmplHTML = tmplHTML(n.tmpl, data, &err)
-		url      = fmt.Sprintf("%sv2/room/%d/notification?auth_token=%s", n.conf.APIURL, n.conf.RoomID, n.conf.AuthToken)
+		url      = fmt.Sprintf("%sv2/room/%s/notification?auth_token=%s", n.conf.APIURL, n.conf.RoomID, n.conf.AuthToken)
 	)
 
 	if n.conf.MessageFormat == "html" {
@@ -623,11 +630,13 @@ type opsGenieMessage struct {
 type opsGenieCreateMessage struct {
 	*opsGenieMessage `json:",inline"`
 
-	Message string            `json:"message"`
-	Details map[string]string `json:"details"`
-	Source  string            `json:"source"`
-	Teams   string            `json:"teams,omitempty"`
-	Tags    string            `json:"tags,omitempty"`
+	Message     string            `json:"message"`
+	Description string            `json:"description,omitempty"`
+	Details     map[string]string `json:"details"`
+	Source      string            `json:"source"`
+	Teams       string            `json:"teams,omitempty"`
+	Tags        string            `json:"tags,omitempty"`
+	Note        string            `json:"note,omitempty"`
 }
 
 type opsGenieCloseMessage struct {
@@ -675,11 +684,13 @@ func (n *OpsGenie) Notify(ctx context.Context, as ...*types.Alert) error {
 		apiURL = n.conf.APIHost + "v1/json/alert"
 		msg = &opsGenieCreateMessage{
 			opsGenieMessage: &apiMsg,
-			Message:         tmpl(n.conf.Description),
+			Message:         tmpl(n.conf.Message),
+			Description:     tmpl(n.conf.Description),
 			Details:         details,
 			Source:          tmpl(n.conf.Source),
 			Teams:           tmpl(n.conf.Teams),
 			Tags:            tmpl(n.conf.Tags),
+			Note:            tmpl(n.conf.Note),
 		}
 	}
 	if err != nil {
@@ -812,4 +823,31 @@ func tmplHTML(tmpl *template.Template, data *template.Data, err *error) func(str
 		s, *err = tmpl.ExecuteHTMLString(name, data)
 		return s
 	}
+}
+
+type loginAuth struct {
+	username, password string
+}
+
+func LoginAuth(username, password string) smtp.Auth {
+	return &loginAuth{username, password}
+}
+
+func (a *loginAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	return "LOGIN", []byte{}, nil
+}
+
+// Used for AUTH LOGIN. (Maybe password should be encrypted)
+func (a *loginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
+	if more {
+		switch string(fromServer) {
+		case "Username:":
+			return []byte(a.username), nil
+		case "Password:":
+			return []byte(a.password), nil
+		default:
+			return nil, errors.New("unexpected server challenge")
+		}
+	}
+	return nil, nil
 }

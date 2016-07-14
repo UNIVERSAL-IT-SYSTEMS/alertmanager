@@ -87,6 +87,7 @@ var (
 		NotifierConfig: NotifierConfig{
 			VSendResolved: true,
 		},
+		Message:     `{{ template "opsgenie.default.message" . }}`,
 		Description: `{{ template "opsgenie.default.description" . }}`,
 		Source:      `{{ template "opsgenie.default.source" . }}`,
 		// TODO: Add a details field with all the alerts.
@@ -274,7 +275,7 @@ func (c *WebhookConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if c.URL == "" {
 		return fmt.Errorf("missing URL in webhook config")
 	}
-	return checkOverflow(c.XXX, "slack config")
+	return checkOverflow(c.XXX, "webhook config")
 }
 
 // OpsGenieConfig configures notifications via OpsGenie.
@@ -283,11 +284,13 @@ type OpsGenieConfig struct {
 
 	APIKey      Secret            `yaml:"api_key"`
 	APIHost     string            `yaml:"api_host"`
+	Message     string            `yaml:"message"`
 	Description string            `yaml:"description"`
 	Source      string            `yaml:"source"`
 	Details     map[string]string `yaml:"details"`
 	Teams       string            `yaml:"teams"`
 	Tags        string            `yaml:"tags"`
+	Note        string            `yaml:"note"`
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`

@@ -16,9 +16,9 @@ package boltmem
 import (
 	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/boltdb/bolt"
 	"github.com/prometheus/alertmanager/provider"
@@ -30,38 +30,59 @@ import (
 var (
 	bktNotificationInfo = []byte("notification_info")
 	bktSilences         = []byte("silences")
-	bktAlerts           = []byte("alerts")
+	// bktAlerts           = []byte("alerts")
 )
 
 // Alerts gives access to a set of alerts. All methods are goroutine-safe.
 type Alerts struct {
-	db *bolt.DB
+	mtx    sync.RWMutex
+	alerts map[model.Fingerprint]*types.Alert
+	stopGC chan struct{}
 
-	mtx       sync.RWMutex
 	listeners map[int]chan *types.Alert
 	next      int
 }
 
 // NewAlerts returns a new alert provider.
 func NewAlerts(path string) (*Alerts, error) {
-	db, err := bolt.Open(filepath.Join(path, "alerts.db"), 0666, nil)
-	if err != nil {
-		return nil, err
-	}
-	err = db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(bktAlerts)
-		return err
-	})
-	return &Alerts{
-		db:        db,
+	a := &Alerts{
+		alerts:    map[model.Fingerprint]*types.Alert{},
+		stopGC:    make(chan struct{}),
 		listeners: map[int]chan *types.Alert{},
 		next:      0,
-	}, err
+	}
+	go a.runGC()
+
+	return a, nil
+}
+
+func (a *Alerts) runGC() {
+	for {
+		select {
+		case <-a.stopGC:
+			return
+		case <-time.After(30 * time.Minute):
+		}
+
+		a.mtx.Lock()
+
+		for fp, alert := range a.alerts {
+			// As we don't persist alerts, we no longer consider them after
+			// they are resolved. Alerts waiting for resolved notifications are
+			// held in memory in aggregation groups redundantly.
+			if alert.EndsAt.Before(time.Now()) {
+				delete(a.alerts, fp)
+			}
+		}
+
+		a.mtx.Unlock()
+	}
 }
 
 // Close the alert provider.
 func (a *Alerts) Close() error {
-	return a.db.Close()
+	close(a.stopGC)
+	return nil
 }
 
 // Subscribe returns an iterator over active alerts that have not been
@@ -128,42 +149,28 @@ func (a *Alerts) GetPending() provider.AlertIterator {
 }
 
 func (a *Alerts) getPending() ([]*types.Alert, error) {
-	var alerts []*types.Alert
+	a.mtx.RLock()
+	defer a.mtx.RUnlock()
 
-	err := a.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bktAlerts)
-		c := b.Cursor()
+	res := make([]*types.Alert, 0, len(a.alerts))
 
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var a types.Alert
-			if err := json.Unmarshal(v, &a); err != nil {
-				return err
-			}
-			alerts = append(alerts, &a)
-		}
+	for _, alert := range a.alerts {
+		res = append(res, alert)
+	}
 
-		return nil
-	})
-	return alerts, err
+	return res, nil
 }
 
 // Get returns the alert for a given fingerprint.
 func (a *Alerts) Get(fp model.Fingerprint) (*types.Alert, error) {
-	var alert types.Alert
-	err := a.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bktAlerts)
+	a.mtx.RLock()
+	defer a.mtx.RUnlock()
 
-		fpb := make([]byte, 8)
-		binary.BigEndian.PutUint64(fpb, uint64(fp))
-
-		ab := b.Get(fpb)
-		if ab == nil {
-			return provider.ErrNotFound
-		}
-
-		return json.Unmarshal(ab, &alert)
-	})
-	return &alert, err
+	alert, ok := a.alerts[fp]
+	if !ok {
+		return nil, provider.ErrNotFound
+	}
+	return alert, nil
 }
 
 // Put adds the given alert to the set.
@@ -171,52 +178,34 @@ func (a *Alerts) Put(alerts ...*types.Alert) error {
 	a.mtx.Lock()
 	defer a.mtx.Unlock()
 
-	err := a.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bktAlerts)
+	for _, alert := range alerts {
+		fp := alert.Fingerprint()
 
-		for _, alert := range alerts {
-			fp := make([]byte, 8)
-			binary.BigEndian.PutUint64(fp, uint64(alert.Fingerprint()))
-
-			ab := b.Get(fp)
-
-			// Merge the alert with the existing one.
-			if ab != nil {
-				var old types.Alert
-				if err := json.Unmarshal(ab, &old); err != nil {
-					return fmt.Errorf("decoding alert failed: %s", err)
-				}
-				// Merge alerts if there is an overlap in activity range.
-				if (alert.EndsAt.After(old.StartsAt) && alert.EndsAt.Before(old.EndsAt)) ||
-					(alert.StartsAt.After(old.StartsAt) && alert.StartsAt.Before(old.EndsAt)) {
-					alert = old.Merge(alert)
-				}
-			}
-
-			ab, err := json.Marshal(alert)
-			if err != nil {
-				return fmt.Errorf("encoding alert failed: %s", err)
-			}
-
-			if err := b.Put(fp, ab); err != nil {
-				return fmt.Errorf("writing alert failed: %s", err)
-			}
-
-			// Send the update to all subscribers.
-			for _, ch := range a.listeners {
-				ch <- alert
+		if old, ok := a.alerts[fp]; ok {
+			// Merge alerts if there is an overlap in activity range.
+			if (alert.EndsAt.After(old.StartsAt) && alert.EndsAt.Before(old.EndsAt)) ||
+				(alert.StartsAt.After(old.StartsAt) && alert.StartsAt.Before(old.EndsAt)) {
+				alert = old.Merge(alert)
 			}
 		}
-		return nil
-	})
 
-	return err
+		a.alerts[fp] = alert
+
+		for _, ch := range a.listeners {
+			ch <- alert
+		}
+	}
+
+	return nil
 }
 
 // Silences gives access to silences. All methods are goroutine-safe.
 type Silences struct {
 	db *bolt.DB
 	mk types.Marker
+
+	mtx   sync.RWMutex
+	cache map[uint64]*types.Silence
 }
 
 // NewSilences creates a new Silences provider.
@@ -229,7 +218,15 @@ func NewSilences(path string, mk types.Marker) (*Silences, error) {
 		_, err := tx.CreateBucketIfNotExists(bktSilences)
 		return err
 	})
-	return &Silences{db: db, mk: mk}, err
+	if err != nil {
+		return nil, err
+	}
+	s := &Silences{
+		db:    db,
+		mk:    mk,
+		cache: map[uint64]*types.Silence{},
+	}
+	return s, s.initCache()
 }
 
 // Close the silences provider.
@@ -261,7 +258,19 @@ func (s *Silences) Mutes(lset model.LabelSet) bool {
 
 // All returns all existing silences.
 func (s *Silences) All() ([]*types.Silence, error) {
-	var res []*types.Silence
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	res := make([]*types.Silence, 0, len(s.cache))
+	for _, s := range s.cache {
+		res = append(res, s)
+	}
+	return res, nil
+}
+
+func (s *Silences) initCache() error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 
 	err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bktSilences)
@@ -272,23 +281,21 @@ func (s *Silences) All() ([]*types.Silence, error) {
 			if err := json.Unmarshal(v, &ms); err != nil {
 				return err
 			}
-			ms.ID = binary.BigEndian.Uint64(k)
-
-			if err := json.Unmarshal(v, &ms); err != nil {
-				return err
-			}
-
-			res = append(res, types.NewSilence(&ms))
+			// The ID is duplicated in the value and always equal
+			// to the stored key.
+			s.cache[ms.ID] = types.NewSilence(&ms)
 		}
 
 		return nil
 	})
-
-	return res, err
+	return err
 }
 
 // Set a new silence.
 func (s *Silences) Set(sil *types.Silence) (uint64, error) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
 	var (
 		uid uint64
 		err error
@@ -312,11 +319,18 @@ func (s *Silences) Set(sil *types.Silence) (uint64, error) {
 		}
 		return b.Put(k, msb)
 	})
-	return uid, err
+	if err != nil {
+		return 0, err
+	}
+	s.cache[uid] = sil
+	return uid, nil
 }
 
 // Del removes a silence.
 func (s *Silences) Del(uid uint64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bktSilences)
 
@@ -325,33 +339,23 @@ func (s *Silences) Del(uid uint64) error {
 
 		return b.Delete(k)
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	delete(s.cache, uid)
+	return nil
 }
 
 // Get a silence associated with a fingerprint.
 func (s *Silences) Get(uid uint64) (*types.Silence, error) {
-	var sil *types.Silence
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
 
-	err := s.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bktSilences)
-
-		k := make([]byte, 8)
-		binary.BigEndian.PutUint64(k, uid)
-
-		v := b.Get(k)
-		if v == nil {
-			return provider.ErrNotFound
-		}
-		var ms model.Silence
-
-		if err := json.Unmarshal(v, &ms); err != nil {
-			return err
-		}
-		sil = types.NewSilence(&ms)
-
-		return nil
-	})
-	return sil, err
+	sil, ok := s.cache[uid]
+	if !ok {
+		return nil, provider.ErrNotFound
+	}
+	return sil, nil
 }
 
 // NotificationInfo provides information about pending and successful
